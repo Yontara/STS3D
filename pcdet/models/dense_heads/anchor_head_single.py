@@ -58,10 +58,16 @@ class AnchorHeadSingle(AnchorHeadTemplate):
             dir_cls_preds = None
 
         if self.training:
-            targets_dict = self.assign_targets(
-                gt_boxes=data_dict['gt_boxes']
-            )
-            self.forward_ret_dict.update(targets_dict)
+            if data_dict.get('pseudo_bbox', None) is not None:
+                pseudo_targets_dict = self.assign_targets(
+                    gt_boxes=data_dict['pseudo_bbox']['pred_boxes']
+                )
+                self.forward_ret_dict.update(pseudo_targets_dict)
+            elif data_dict.get('gt_boxes', None) is not None:
+                targets_dict = self.assign_targets(
+                    gt_boxes=data_dict['gt_boxes']
+                )
+                self.forward_ret_dict.update(targets_dict)
 
         if not self.training or self.predict_boxes_when_training:
             batch_cls_preds, batch_box_preds = self.generate_predicted_boxes(
