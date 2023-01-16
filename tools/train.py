@@ -22,6 +22,7 @@ def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
 
+    parser.add_argument('--self_training', type=bool, default=False, required=False, help='conduct self training')
     parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
     parser.add_argument('--epochs', type=int, default=None, required=False, help='number of epochs to train for')
     parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
@@ -92,7 +93,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    log_file = output_dir / ('train_%s.log' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+    log_file = output_dir / ('log_train_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     logger = common_utils.create_logger(log_file, rank=cfg.LOCAL_RANK)
 
     # log to file
@@ -101,10 +102,7 @@ def main():
     logger.info('CUDA_VISIBLE_DEVICES=%s' % gpu_list)
 
     if dist_train:
-        logger.info('Training in distributed mode : total_batch_size: %d' % (total_gpus * args.batch_size))
-    else:
-        logger.info('Training with a single process')
-        
+        logger.info('total_batch_size: %d' % (total_gpus * args.batch_size))
     for key, val in vars(args).items():
         logger.info('{:16} {}'.format(key, val))
     log_config_to_file(cfg, logger=logger)
@@ -113,7 +111,7 @@ def main():
 
     tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
 
-    logger.info("----------- Create dataloader & network & optimizer -----------")
+    # -----------------------create dataloader & network & optimizer---------------------------
     train_set, train_loader, train_sampler = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
@@ -126,21 +124,30 @@ def main():
         seed=666 if args.fix_random_seed else None
     )
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
-    if args.sync_bn:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
+    student_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
 
-    optimizer = build_optimizer(model, cfg.OPTIMIZATION)
+    if args.sync_bn:
+        student_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(student_model)
+    student_model.cuda()
+
+    if args.self_training:
+        teacher_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
+        teacher_model.cuda()
+
+    optimizer = build_optimizer(student_model, cfg.OPTIMIZATION)
 
     # load checkpoint if it is possible
     start_epoch = it = 0
     last_epoch = -1
     if args.pretrained_model is not None:
-        model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist_train, logger=logger)
+        student_model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist_train, logger=logger)
+        if args.self_training:
+            teacher_model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist_train, logger=logger)
 
     if args.ckpt is not None:
-        it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist_train, optimizer=optimizer, logger=logger)
+        it, start_epoch = student_model.load_params_with_optimizer(args.ckpt, to_cpu=dist_train, optimizer=optimizer, logger=logger)
+        if args.self_training:
+            teacher_model.load_params_with_optimizer(args.ckpt + '_teacher', to_cpu=dist_train, optimizer=optimizer, logger=logger)
         last_epoch = start_epoch + 1
     else:
         ckpt_list = glob.glob(str(ckpt_dir / '*.pth'))
@@ -149,19 +156,24 @@ def main():
             ckpt_list.sort(key=os.path.getmtime)
             while len(ckpt_list) > 0:
                 try:
-                    it, start_epoch = model.load_params_with_optimizer(
+                    it, start_epoch = student_model.load_params_with_optimizer(
                         ckpt_list[-1], to_cpu=dist_train, optimizer=optimizer, logger=logger
                     )
+                    if args.self_training:
+                        teacher_model.load_params_with_optimizer(
+                            ckpt_list[-1], to_cpu=dist_train, optimizer=optimizer, logger=logger
+                        )
                     last_epoch = start_epoch + 1
                     break
                 except:
                     ckpt_list = ckpt_list[:-1]
 
-    model.train()  # before wrap to DistributedDataParallel to support fixed some parameters
+    student_model.train()  # before wrap to DistributedDataParallel to support fixed some parameters
+    if args.self_training:
+        teacher_model.eval()
     if dist_train:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[cfg.LOCAL_RANK % torch.cuda.device_count()])
-    logger.info(f'----------- Model {cfg.MODEL.NAME} created, param count: {sum([m.numel() for m in model.parameters()])} -----------')
-    logger.info(model)
+        student_model = nn.parallel.DistributedDataParallel(student_model, device_ids=[cfg.LOCAL_RANK % torch.cuda.device_count()])
+    logger.info(student_model)
 
     lr_scheduler, lr_warmup_scheduler = build_scheduler(
         optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
@@ -172,8 +184,12 @@ def main():
     logger.info('**********************Start training %s/%s(%s)**********************'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
 
+    if args.self_training is False:
+        teacher_model = None
+
     train_model(
-        model,
+        student_model,
+        teacher_model,
         optimizer,
         train_loader,
         model_func=model_fn_decorator(),
@@ -217,7 +233,7 @@ def main():
     args.start_epoch = max(args.epochs - args.num_epochs_to_eval, 0)  # Only evaluate the last args.num_epochs_to_eval epochs
 
     repeat_eval_ckpt(
-        model.module if dist_train else model,
+        student_model.module if dist_train else student_model,
         test_loader, args, eval_output_dir, logger, ckpt_dir,
         dist_test=dist_train
     )
