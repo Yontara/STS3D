@@ -4,11 +4,40 @@ import torch
 import tqdm
 import time
 import glob
+import numpy as np
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
+from pcdet.models import load_data_to_gpu
 
+import pickle
 
-def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
+def update_ema_variables(model, ema_model, alpha, global_step):
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+def generate_pseudo_label(model, dataloader, epoch, threshold=0.3):
+    model.eval()
+
+    pseudo_labels_single_scene = torch.tensor([])
+    for i, batch_dict in enumerate(dataloader):
+        with torch.no_grad():
+            load_data_to_gpu(batch_dict)
+            pred_dicts, _ = model.forward(batch_dict)
+
+        for i, scene in enumerate(pred_dicts):
+            pseudo_label_indices = [i for i, pred_score in enumerate(scene['pred_scores']) if pred_score > threshold]
+            pseudo_label = {
+                'frame_id': batch_dict['frame_id'][i],
+                'pseudo_bbox': [scene['pred_boxes'][i] for i in pseudo_label_indices],
+                'score': [scene['pred_scores'][i] for i in pseudo_label_indices]
+                }
+            pseudo_labels_single_scene.append(pseudo_label)
+    
+    with open('pseudo_labels/pseudo_label_epoch_' + str(epoch) + '.pickle', 'wb') as fw:
+        pickle.dump(pseudo_labels_single_scene, fw)
+        
+
+def train_one_epoch(student_model, teacher_model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, 
                     use_logger_to_record=False, logger=None, logger_iter_interval=50, cur_epoch=None, 
                     total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, use_amp=False):
@@ -25,7 +54,6 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         data_time = common_utils.AverageMeter()
         batch_time = common_utils.AverageMeter()
         forward_time = common_utils.AverageMeter()
-        losses_m = common_utils.AverageMeter()
 
     end = time.time()
     for cur_it in range(start_it, total_it_each_epoch):
@@ -49,15 +77,32 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         if tb_log is not None:
             tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
 
-        model.train()
+        # add prediction of teacher model to batch
+        if teacher_model is not None:
+            teacher_model.cuda()
+            with torch.no_grad():
+                load_data_to_gpu(batch)
+                teacher_model.eval()
+                pred_dicts,_ = teacher_model.forward(batch)
+
+                max_gt = max([len(x['pred_boxes']) for x in pred_dicts])
+                pred_boxes = torch.zeros((batch['batch_size'], max_gt, pred_dicts[0]['pred_boxes'].shape[-1] + 1), dtype=torch.float32).cuda()
+                for k in range(batch['batch_size']):
+                    pred_boxes[k, :pred_dicts[k]['pred_boxes'].__len__(), :] = \
+                        torch.cat((pred_dicts[k]['pred_boxes'], pred_dicts[k]['pred_labels'].reshape(-1,1)), dim=1)
+
+                pseudo_bbox = {'pred_boxes': pred_boxes, 'pred_scores': pred_dicts}
+                batch['pseudo_bbox'] = pseudo_bbox
+
+        student_model.train()
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=use_amp):
-            loss, tb_dict, disp_dict = model_func(model, batch)
+            loss, tb_dict, disp_dict = model_func(student_model, batch)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+        clip_grad_norm_(student_model.parameters(), optim_cfg.GRAD_NORM_CLIP)
         scaler.step(optimizer)
         scaler.update()
 
@@ -74,12 +119,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
         # log to console and tensorboard
         if rank == 0:
-            batch_size = batch.get('batch_size', None)
-            
             data_time.update(avg_data_time)
             forward_time.update(avg_forward_time)
             batch_time.update(avg_batch_time)
-            losses_m.update(loss.item() , batch_size)
             
             disp_dict.update({
                 'loss': loss.item(), 'lr': cur_lr, 'd_time': f'{data_time.val:.2f}({data_time.avg:.2f})',
@@ -94,28 +136,14 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                     trained_time_each_epoch = pbar.format_dict['elapsed']
                     remaining_second_each_epoch = second_each_iter * (total_it_each_epoch - cur_it)
                     remaining_second_all = second_each_iter * ((total_epochs - cur_epoch) * total_it_each_epoch - cur_it)
-                    
-                    logger.info(
-                        'Train: {:>4d}/{} ({:>3.0f}%) [{:>4d}/{} ({:>3.0f}%)]  '
-                        'Loss: {loss.val:#.4g} ({loss.avg:#.3g})  '
-                        'LR: {lr:.3e}  '
-                        f'Time cost: {tbar.format_interval(trained_time_each_epoch)}/{tbar.format_interval(remaining_second_each_epoch)} ' 
-                        f'[{tbar.format_interval(trained_time_past_all)}/{tbar.format_interval(remaining_second_all)}]  '
-                        'Acc_iter {acc_iter:<10d}  '
-                        'Data time: {data_time.val:.2f}({data_time.avg:.2f})  '
-                        'Forward time: {forward_time.val:.2f}({forward_time.avg:.2f})  '
-                        'Batch time: {batch_time.val:.2f}({batch_time.avg:.2f})'.format(
-                            cur_epoch+1,total_epochs, 100. * (cur_epoch+1) / total_epochs,
-                            cur_it,total_it_each_epoch, 100. * cur_it / total_it_each_epoch,
-                            loss=losses_m,
-                            lr=cur_lr,
-                            acc_iter=accumulated_iter,
-                            data_time=data_time,
-                            forward_time=forward_time,
-                            batch_time=batch_time
-                            )
-                    )
-                    
+
+                    disp_str = ', '.join([f'{key}={val}' for key, val in disp_dict.items() if key != 'lr'])
+                    disp_str += f', lr={disp_dict["lr"]}'
+                    batch_size = batch.get('batch_size', None)
+                    logger.info(f'epoch: {cur_epoch}/{total_epochs}, acc_iter={accumulated_iter}, cur_iter={cur_it}/{total_it_each_epoch}, batch_size={batch_size}, '
+                                f'time_cost(epoch): {tbar.format_interval(trained_time_each_epoch)}/{tbar.format_interval(remaining_second_each_epoch)}, '
+                                f'time_cost(all): {tbar.format_interval(trained_time_past_all)}/{tbar.format_interval(remaining_second_all)}, '
+                                f'{disp_str}')
                     if show_gpu_stat and accumulated_iter % (3 * logger_iter_interval) == 0:
                         # To show the GPU utilization, please install gpustat through "pip install gpustat"
                         gpu_info = os.popen('gpustat').read()
@@ -137,22 +165,30 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             if time_past_this_epoch // ckpt_save_time_interval >= ckpt_save_cnt:
                 ckpt_name = ckpt_save_dir / 'latest_model'
                 save_checkpoint(
-                    checkpoint_state(model, optimizer, cur_epoch, accumulated_iter), filename=ckpt_name,
+                    checkpoint_state(student_model, optimizer, cur_epoch, accumulated_iter), filename=ckpt_name,
                 )
                 logger.info(f'Save latest model to {ckpt_name}')
                 ckpt_save_cnt += 1
                 
+    # teacher_model.update_weight_ema(student_model.weights)
+    if teacher_model is not None:
+        update_ema_variables(student_model, teacher_model, 0.999, cur_epoch)
+
     if rank == 0:
         pbar.close()
     return accumulated_iter
 
 
-def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
+def train_model(student_model, teacher_model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False):
     accumulated_iter = start_iter
+
+    # model_teacher = model
+    # model_teacher.eval()
+
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
         if merge_all_iters_to_one_epoch:
@@ -170,8 +206,16 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 cur_scheduler = lr_warmup_scheduler
             else:
                 cur_scheduler = lr_scheduler
+
+            # # generate pseudo labels once per 5 epochs
+            # if not cur_epoch % 6:
+            #     # update_weight_EMA(model_teacher, model)
+            #     train_loader.dataset.eval()
+            #     generate_pseudo_label(student_model, train_loader, epoch=cur_epoch)
+            #     train_loader.dataset.train()
+
             accumulated_iter = train_one_epoch(
-                model, optimizer, train_loader, model_func,
+                student_model, teacher_model, optimizer, train_loader, model_func,
                 lr_scheduler=cur_scheduler,
                 accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
                 rank=rank, tbar=tbar, tb_log=tb_log,
@@ -200,8 +244,13 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
 
                 ckpt_name = ckpt_save_dir / ('checkpoint_epoch_%d' % trained_epoch)
                 save_checkpoint(
-                    checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
+                    checkpoint_state(student_model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
                 )
+
+                if teacher_model is not None:
+                    save_checkpoint(
+                        checkpoint_state(teacher_model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name + '_teacher',
+                    )
 
 
 def model_state_to_cpu(model_state):
